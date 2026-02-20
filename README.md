@@ -4,6 +4,8 @@ This repository contains a simple Flashbots "searcher" for submitting a transact
 
 We hope you will use this repository as an example of how to integrate Flashbots into your own Flashbot searcher (bot). For more information, see the [Flashbots Searcher Quick Start](https://docs.flashbots.net/flashbots-auction/searchers/quick-start/)
 
+<!-- @import "[TOC]" {cmd="toc" depthFrom=1 depthTo=6 orderedList=false} -->
+
 Use case
 ========
 The use case for this multi-transaction setup is to make calls from an account that has a compromised private key. Since transferring in any ETH to this compromised wallet will immediately be swept by bots that monitor that account, transferring in funds will also give any attacker the ability to withdraw tokens that are held by that account.

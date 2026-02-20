@@ -1,5 +1,6 @@
 import { BigNumber, Contract, providers, Wallet, utils } from "ethers";
 import {
+  TokenTransferTx,
   signRescueBundle,
   submitRescueBundle,
   formatEther,
@@ -11,13 +12,39 @@ require("log-timestamp");
 // ============ CONFIGURATION ============
 
 const BASE_RPC_URL = process.env.BASE_RPC_URL || "https://mainnet.base.org";
+
+/**
+ * PRIVATE RPC STRATEGY
+ *
+ * Submitting through a private/protected RPC reduces the chance that
+ * sweeper bots watching the public mempool can front-run your transfer.
+ *
+ * Options for Base chain (in preference order):
+ *   1. dRPC MEV protection (paid): https://base.drpc.org  (set BASE_RPC_URL)
+ *   2. Alchemy private endpoint:   https://base-mainnet.g.alchemy.com/v2/<KEY>
+ *   3. Coinbase CDP node:          https://api.developer.coinbase.com/rpc/v1/base/<KEY>
+ *   4. Public fallback:            https://mainnet.base.org
+ *
+ * Set BASE_RPC_URL in your .env to whichever private endpoint you have access to.
+ * The rescue logic is identical regardless of which RPC you use — the difference
+ * is only whether your transactions are visible in the public mempool before inclusion.
+ *
+ * Note: Unlike Flashbots on mainnet, Base has no native atomic bundle guarantee.
+ * The rapid-burst strategy (sign all → submit funding → immediately blast transfers)
+ * combined with aggressive priority fees is the closest equivalent available.
+ */
+
 const PRIVATE_KEY_EXECUTOR = process.env.PRIVATE_KEY_EXECUTOR || "";
 const PRIVATE_KEY_SPONSOR = process.env.PRIVATE_KEY_SPONSOR || "";
 const RECIPIENT = process.env.RECIPIENT || "";
 
-// Target token to rescue
+// Target tokens to rescue — comma-separated for multi-token rescue
 const RNBW_ADDRESS = "0xa53887F7e7c1bf5010b8627F1C1ba94fE7a5d6E0";
-const TOKEN_ADDRESS = process.env.TOKEN_ADDRESS || RNBW_ADDRESS;
+const TOKEN_ADDRESSES_RAW =
+  process.env.TOKEN_ADDRESSES ||
+  process.env.TOKEN_ADDRESS ||
+  RNBW_ADDRESS;
+const TOKEN_ADDRESSES = TOKEN_ADDRESSES_RAW.split(",").map((a) => a.trim()).filter(Boolean);
 
 // Gas settings (Base gas is very cheap)
 const PRIORITY_FEE_GWEI = parseFloat(process.env.PRIORITY_FEE_GWEI || "0.5");
@@ -60,6 +87,50 @@ function validateEnv(): void {
   }
 }
 
+// ============ TOKEN INFO ============
+
+interface TokenInfo {
+  address: string;
+  name: string;
+  symbol: string;
+  decimals: number;
+  balance: BigNumber;
+  transferData: string;
+}
+
+async function getTokenInfo(
+  provider: providers.JsonRpcProvider,
+  tokenAddress: string,
+  executorAddress: string,
+): Promise<TokenInfo | null> {
+  const tokenContract = new Contract(tokenAddress, ERC20_ABI, provider);
+  let name: string, symbol: string, decimals: number, balance: BigNumber;
+
+  try {
+    [name, symbol, decimals, balance] = await Promise.all([
+      tokenContract.name(),
+      tokenContract.symbol(),
+      tokenContract.decimals(),
+      tokenContract.balanceOf(executorAddress),
+    ]);
+  } catch (e: any) {
+    console.error(`Failed to read token ${tokenAddress}: ${e.message}`);
+    return null;
+  }
+
+  if (balance.isZero()) {
+    console.log(`  No balance: ${symbol} (${tokenAddress})`);
+    return null;
+  }
+
+  const transferData = tokenContract.interface.encodeFunctionData("transfer", [
+    RECIPIENT,
+    balance,
+  ]);
+
+  return { address: tokenAddress, name, symbol, decimals, balance, transferData };
+}
+
 // ============ MAIN RESCUE FLOW ============
 
 async function main() {
@@ -67,13 +138,30 @@ async function main() {
 
   console.log("========================================");
   console.log("  BASE CHAIN TOKEN RESCUE");
-  console.log("  Strategy: Rapid Burst Submission");
+  console.log("  Strategy: Rapid Burst + Retry with Gas Escalation");
   console.log("========================================\n");
+
+  // Warn if using public RPC — private is strongly preferred
+  if (
+    BASE_RPC_URL === "https://mainnet.base.org" ||
+    BASE_RPC_URL.includes("publicnode") ||
+    BASE_RPC_URL.includes("ankr.com/rpc/base")
+  ) {
+    console.warn("========================================");
+    console.warn("  WARNING: PUBLIC RPC DETECTED");
+    console.warn("========================================");
+    console.warn("Your transactions will be visible in the public mempool.");
+    console.warn("Sweeper bots can front-run your transfer.");
+    console.warn(
+      "Set BASE_RPC_URL to a private endpoint (Alchemy, dRPC, Coinbase CDP) for better protection.\n",
+    );
+  }
 
   // Connect to Base
   const provider = new providers.JsonRpcProvider(BASE_RPC_URL);
   const network = await provider.getNetwork();
   console.log(`Network: ${network.name} (chainId: ${network.chainId})`);
+  console.log(`RPC: ${BASE_RPC_URL}`);
 
   if (network.chainId !== 8453 && network.chainId !== 84532) {
     console.warn(
@@ -85,10 +173,21 @@ async function main() {
   const walletExecutor = new Wallet(PRIVATE_KEY_EXECUTOR, provider);
   const walletSponsor = new Wallet(PRIVATE_KEY_SPONSOR, provider);
 
-  console.log(`Executor (compromised): ${walletExecutor.address}`);
+  console.log(`\nExecutor (compromised): ${walletExecutor.address}`);
   console.log(`Sponsor (pays gas):     ${walletSponsor.address}`);
   console.log(`Recipient (safe):       ${RECIPIENT}`);
-  console.log(`Token:                  ${TOKEN_ADDRESS}\n`);
+  console.log(`Tokens:                 ${TOKEN_ADDRESSES.join(", ")}\n`);
+
+  // Check gas settings vs current baseFee
+  const block = await provider.getBlock("latest");
+  const baseFee = block.baseFeePerGas || BigNumber.from(0);
+  const baseFeeGwei = parseFloat(utils.formatUnits(baseFee, "gwei"));
+  if (MAX_FEE_GWEI < baseFeeGwei * 1.5) {
+    console.warn(
+      `WARNING: MAX_FEE_GWEI (${MAX_FEE_GWEI}) is below 1.5x current baseFee (${(baseFeeGwei * 1.5).toFixed(4)} gwei). ` +
+        `Consider increasing MAX_FEE_GWEI for faster inclusion.\n`,
+    );
+  }
 
   // Check for EIP-7702 delegation
   const executorCode = await provider.getCode(walletExecutor.address);
@@ -107,67 +206,59 @@ async function main() {
     );
   }
 
-  // Get token info and balance
-  const tokenContract = new Contract(TOKEN_ADDRESS, ERC20_ABI, provider);
+  // Fetch token info for all addresses
+  console.log("--- SCANNING TOKENS ---");
+  const tokenInfoResults = await Promise.all(
+    TOKEN_ADDRESSES.map((addr) =>
+      getTokenInfo(provider, addr, walletExecutor.address),
+    ),
+  );
+  const tokens = tokenInfoResults.filter((t): t is TokenInfo => t !== null);
 
-  let tokenSymbol: string;
-  let tokenDecimals: number;
-  let tokenBalance: BigNumber;
-  let tokenName: string;
-
-  try {
-    [tokenName, tokenSymbol, tokenDecimals, tokenBalance] = await Promise.all([
-      tokenContract.name(),
-      tokenContract.symbol(),
-      tokenContract.decimals(),
-      tokenContract.balanceOf(walletExecutor.address),
-    ]);
-  } catch (e: any) {
-    console.error(`Failed to read token contract: ${e.message}`);
-    process.exit(1);
-  }
-
-  if (tokenBalance.isZero()) {
+  if (tokens.length === 0) {
     console.error(
-      `No ${tokenSymbol} balance found for ${walletExecutor.address}`,
+      `No token balances found for ${walletExecutor.address} across all specified tokens.`,
     );
     process.exit(1);
   }
 
-  const formattedBalance = utils.formatUnits(tokenBalance, tokenDecimals);
-  console.log(`Token: ${tokenName} (${tokenSymbol})`);
-  console.log(`Balance: ${formattedBalance} ${tokenSymbol}`);
+  console.log(`\nFound ${tokens.length} token(s) to rescue:`);
+  tokens.forEach((t) => {
+    const formatted = utils.formatUnits(t.balance, t.decimals);
+    console.log(`  ${formatted} ${t.symbol} (${t.address})`);
+  });
 
   // Check sponsor ETH balance
   const sponsorBalance = await provider.getBalance(walletSponsor.address);
-  console.log(`Sponsor ETH: ${formatEther(sponsorBalance)} ETH\n`);
+  console.log(`\nSponsor ETH: ${formatEther(sponsorBalance)} ETH`);
 
-  // Build token transfer calldata
-  const transferData = tokenContract.interface.encodeFunctionData("transfer", [
-    RECIPIENT,
-    tokenBalance,
-  ]);
+  // Build transfer calldata for each token and estimate gas
+  console.log("\n--- ESTIMATING GAS ---");
+  const tokenTransferTxs: TokenTransferTx[] = [];
 
-  // Estimate gas for the token transfer
-  let gasEstimate: BigNumber;
-  try {
-    gasEstimate = await provider.estimateGas({
-      from: walletExecutor.address,
-      to: TOKEN_ADDRESS,
-      data: transferData,
+  for (const token of tokens) {
+    let gasEstimate: BigNumber;
+    try {
+      gasEstimate = await provider.estimateGas({
+        from: walletExecutor.address,
+        to: token.address,
+        data: token.transferData,
+      });
+      gasEstimate = gasEstimate.mul(120).div(100); // 20% buffer
+    } catch (e: any) {
+      console.warn(
+        `Gas estimation failed for ${token.symbol} (expected if executor has no ETH): ${e.message}`,
+      );
+      gasEstimate = BigNumber.from(65000);
+      console.log(`  Using default gas limit for ${token.symbol}: 65000`);
+    }
+    console.log(`  ${token.symbol}: ${gasEstimate.toString()} gas`);
+    tokenTransferTxs.push({
+      to: token.address,
+      data: token.transferData,
+      gasLimit: gasEstimate,
     });
-    // Add 20% buffer for safety
-    gasEstimate = gasEstimate.mul(120).div(100);
-  } catch (e: any) {
-    console.warn(
-      `Gas estimation failed (expected if executor has no ETH): ${e.message}`,
-    );
-    // Use a safe default for ERC-20 transfers
-    gasEstimate = BigNumber.from(65000);
-    console.log(`Using default gas limit: ${gasEstimate.toString()}`);
   }
-
-  console.log(`Gas estimate: ${gasEstimate.toString()}`);
 
   // Pre-sign all transactions
   console.log("\n--- PRE-SIGNING TRANSACTIONS ---");
@@ -176,13 +267,7 @@ async function main() {
     provider,
     walletSponsor,
     walletExecutor,
-    [
-      {
-        to: TOKEN_ADDRESS,
-        data: transferData,
-        gasLimit: gasEstimate,
-      },
-    ],
+    tokenTransferTxs,
     PRIORITY_FEE_GWEI,
     MAX_FEE_GWEI,
     executorIsContract,
@@ -192,13 +277,17 @@ async function main() {
   console.log(`Max fee: ${formatGwei(bundle.gasPrice)} gwei`);
 
   // Account for both executor gas cost AND the funding TX's own gas
-  const fundingTxGas = BigNumber.from(21000).mul(bundle.gasPrice);
+  const fundingTxGas = BigNumber.from(executorIsContract ? 100000 : 21000).mul(bundle.gasPrice);
   const totalRequired = bundle.totalGasCost.add(fundingTxGas);
 
   if (sponsorBalance.lt(totalRequired)) {
     console.error(
-      `\nERROR: Sponsor has insufficient ETH. Need ${formatEther(totalRequired)} ETH (${formatEther(bundle.totalGasCost)} for executor + ${formatEther(fundingTxGas)} for funding TX gas), have ${formatEther(sponsorBalance)} ETH`,
+      `\nERROR: Sponsor has insufficient ETH.`,
     );
+    console.error(
+      `  Need:  ${formatEther(totalRequired)} ETH (${formatEther(bundle.totalGasCost)} executor gas + ${formatEther(fundingTxGas)} funding TX gas)`,
+    );
+    console.error(`  Have:  ${formatEther(sponsorBalance)} ETH`);
     process.exit(1);
   }
 
@@ -206,49 +295,68 @@ async function main() {
   console.log("\n========================================");
   console.log("  RESCUE SUMMARY");
   console.log("========================================");
-  console.log(`Token:        ${formattedBalance} ${tokenSymbol}`);
+  tokens.forEach((t) => {
+    console.log(`  ${utils.formatUnits(t.balance, t.decimals)} ${t.symbol}`);
+  });
   console.log(`Gas cost:     ${formatEther(bundle.totalGasCost)} ETH`);
-  console.log(`TX Count:     1 funding + 1 transfer = 2 total`);
-  console.log(`Strategy:     Submit funding, immediately blast transfer`);
+  console.log(`Max fee:      ${formatGwei(bundle.gasPrice)} gwei`);
+  console.log(`TX Count:     1 funding + ${tokens.length} transfer(s) = ${1 + tokens.length} total`);
+  console.log(`Strategy:     Submit funding → blast transfer(s) → retry with gas escalation if needed`);
+  console.log(`Retries:      Up to 3 attempts (1x → 1.3x → 1.69x gas)`);
   console.log("========================================\n");
 
   // Execute the rescue
   console.log(">>> EXECUTING RESCUE <<<\n");
 
-  try {
-    const result = await submitRescueBundle(provider, bundle);
+  const result = await submitRescueBundle(
+    provider,
+    bundle,
+    walletExecutor,
+    walletSponsor,
+    tokenTransferTxs,
+    PRIORITY_FEE_GWEI,
+    executorIsContract,
+  );
 
-    console.log("\n========================================");
-    if (result.success) {
-      console.log("  RESCUE SUCCESSFUL!");
+  console.log("\n========================================");
+  if (result.success) {
+    console.log("  RESCUE SUCCESSFUL!");
+    tokens.forEach((t) => {
       console.log(
-        `  ${formattedBalance} ${tokenSymbol} transferred to ${RECIPIENT}`,
+        `  ${utils.formatUnits(t.balance, t.decimals)} ${t.symbol} → ${RECIPIENT}`,
       );
-    } else {
-      console.log("  RESCUE FAILED");
-      console.log(
-        "  The sweeper may have drained the gas before the transfer executed.",
-      );
-      console.log("  Check the transaction hashes below for details.");
-    }
-    console.log("========================================");
-    console.log(`Funding TX:  ${result.fundingHash}`);
-    result.transferHashes.forEach((hash, i) => {
-      console.log(`Transfer #${i}: ${hash}`);
     });
+    console.log(`  Completed in ${result.attempts} attempt(s)`);
+  } else {
+    console.log("  RESCUE FAILED");
+    console.log(`  Attempted ${result.attempts} time(s)`);
+    console.log(
+      "  The sweeper may have drained the gas before the transfer executed.",
+    );
+    if (result.error) {
+      console.log(`  Last error: ${result.error}`);
+    }
+    console.log(
+      "  Consider: higher MAX_FEE_GWEI, a private RPC endpoint, or re-running immediately.",
+    );
+    console.log("  Check the transaction hashes below for details.");
+  }
+  console.log("========================================");
+
+  if (result.fundingHash) {
+    console.log(`\nFunding TX:  ${result.fundingHash}`);
+  }
+  result.transferHashes.forEach((hash, i) => {
+    console.log(`Transfer #${i}: ${hash}`);
+  });
+
+  if (result.transferHashes.length > 0) {
     console.log(
       `\nView on Basescan: https://basescan.org/tx/${result.transferHashes[0]}`,
     );
-  } catch (e: any) {
-    console.error(`\nRESCUE ERROR: ${e.message}`);
+  }
 
-    if (e.message.includes("insufficient funds")) {
-      console.error(
-        "\nThe sweeper likely drained the ETH before the transfer could execute.",
-      );
-      console.error("Consider running the script again with higher gas fees.");
-    }
-
+  if (!result.success) {
     process.exit(1);
   }
 }
