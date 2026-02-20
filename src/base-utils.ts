@@ -1,5 +1,4 @@
-import { BigNumberish, BigNumberish, Provider, Wallet, utils, Provider } from "ethers";
-import { JsonRpcProvider } from 'ethers';
+import { BigNumber, providers, Wallet, utils } from "ethers";
 
 export const GWEI = BigNumber.from(10).pow(9);
 
@@ -76,9 +75,8 @@ export async function signRescueBundle(
   const maxFee = utils.parseUnits(cappedMaxFeeGwei.toString(), "gwei");
 
   // Use higher of configured max fee or baseFee * 2 + priority
-  const effectiveMaxFee = baseFee.mul(2).add(priorityFee).gt(maxFee)
-    ? baseFee.mul(2).add(priorityFee)
-    : maxFee;
+  const basePlusPriority = baseFee.mul(2).add(priorityFee);
+  const effectiveMaxFee = basePlusPriority.gt(maxFee) ? basePlusPriority : maxFee;
 
   const totalExecutorGas = tokenTransferTxs.reduce(
     (acc, tx) => acc.add(tx.gasLimit),
