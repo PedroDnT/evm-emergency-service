@@ -1,4 +1,5 @@
-import { BigNumberish, Provider, Wallet, utils } from "ethers";
+import { BigNumberish, BigNumberish, Provider, Wallet, utils, Provider } from "ethers";
+import { JsonRpcProvider } from 'ethers';
 
 export const GWEI = BigNumber.from(10).pow(9);
 
