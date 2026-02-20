@@ -1,4 +1,4 @@
-import { BigNumber, providers, Wallet, utils } from "ethers";
+import { BigNumberish, Provider, Wallet, utils } from "ethers";
 
 export const GWEI = BigNumber.from(10).pow(9);
 

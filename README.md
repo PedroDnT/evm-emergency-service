@@ -106,7 +106,7 @@ If the funding TX confirmed but transfers failed, the tool skips re-funding and 
 
 If the compromised wallet has contract code (EIP-7702 delegation), the tool will warn you. A delegated `receive()` function may intercept incoming ETH. In this case:
 - The tool still attempts the rescue with a higher funding gas limit (100k)
-- If funding fails, you must revoke the EIP-7702 delegation first
+- Check the delegation first and revoke it if possible.
 
 ---
 
