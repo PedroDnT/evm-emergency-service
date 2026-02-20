@@ -64,30 +64,27 @@ export async function signRescueBundle(
   priorityFeeGwei: number = 0.5,
   maxFeeGwei: number = 2,
   executorIsContract: boolean = false,
-  gasFactor: number = 100, // percentage multiplier for escalation (100 = no escalation)
+  gasFactor: number = 100,
 ): Promise<SignedRescueBundle> {
   const block = await provider.getBlock("latest");
   const baseFee = block.baseFeePerGas || BigNumber.from(0);
   const priorityFee = utils.parseUnits(priorityFeeGwei.toString(), "gwei");
 
-  // Scale the configured max fee by the escalation factor
   const scaledMaxFeeGwei = (maxFeeGwei * gasFactor) / 100;
   const cappedMaxFeeGwei = Math.min(scaledMaxFeeGwei, MAX_FEE_CAP_GWEI);
   const maxFee = utils.parseUnits(cappedMaxFeeGwei.toString(), "gwei");
 
-  // Use the higher of configured max fee or baseFee * 2 + priority (to ensure inclusion)
+  // Use higher of configured max fee or baseFee * 2 + priority
   const effectiveMaxFee = baseFee.mul(2).add(priorityFee).gt(maxFee)
     ? baseFee.mul(2).add(priorityFee)
     : maxFee;
 
-  // Calculate total gas needed by executor
   const totalExecutorGas = tokenTransferTxs.reduce(
     (acc, tx) => acc.add(tx.gasLimit),
     BigNumber.from(0),
   );
   const totalGasCost = totalExecutorGas.mul(effectiveMaxFee);
 
-  // Fetch fresh nonces using "pending" to detect sweeper activity
   const { sponsorNonce, executorNonce } = await fetchNonces(
     provider,
     walletSponsor.address,
@@ -96,7 +93,6 @@ export async function signRescueBundle(
 
   const chainId = (await provider.getNetwork()).chainId;
 
-  // Sign funding tx: sponsor -> executor
   // EIP-7702 delegated accounts may need more gas for receive()
   const fundingGasLimit = executorIsContract ? 100000 : 21000;
   const fundingTx = await walletSponsor.signTransaction({
@@ -110,7 +106,6 @@ export async function signRescueBundle(
     chainId,
   });
 
-  // Sign token transfer txs: executor -> recipient
   const transferTxs: string[] = [];
   for (let i = 0; i < tokenTransferTxs.length; i++) {
     const tx = tokenTransferTxs[i];
@@ -190,9 +185,31 @@ async function isFunded(
 }
 
 /**
+ * Fire-and-forget broadcast of a signed raw TX to secondary (private) providers.
+ * Errors are swallowed — secondary providers are best-effort only.
+ */
+function broadcastToPrivateProviders(
+  signedTx: string,
+  privateProviders: providers.JsonRpcProvider[],
+  label: string,
+): void {
+  for (const pp of privateProviders) {
+    pp.sendTransaction(signedTx).catch((err) => {
+      console.warn(`[PRIVATE RPC] ${label} broadcast failed: ${err.message}`);
+    });
+  }
+}
+
+/**
  * Submit all signed transactions as fast as possible.
  * Sends funding tx first, then blasts all transfer txs in parallel.
  * Implements retry loop with gas escalation on failure.
+ *
+ * Private TX strategy:
+ *   If privateProviders is set, every signed TX is also broadcast to those
+ *   endpoints in parallel (fire-and-forget). Use MEV-protected RPCs such as
+ *   the dRPC MEV endpoint to keep TXs out of the public mempool until block
+ *   inclusion, reducing front-running / sweeper-bot exposure on Base.
  *
  * Retry strategy:
  *   Attempt 1: original gas price
@@ -207,9 +224,10 @@ export async function submitRescueBundle(
   tokenTransferTxs: TokenTransferTx[],
   priorityFeeGwei: number = 0.5,
   executorIsContract: boolean = false,
+  privateProviders: providers.JsonRpcProvider[] = [],
 ): Promise<RescueResult> {
   let lastError: string | undefined;
-  let gasFactor = 100; // starts at 100% (no escalation)
+  let gasFactor = 100;
 
   for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
     if (attempt > 1) {
@@ -222,7 +240,6 @@ export async function submitRescueBundle(
         `\n[RETRY] Attempt ${attempt}/${MAX_RETRY_ATTEMPTS} | Gas: ${escalatedGwei} gwei`,
       );
 
-      // Re-sign the entire bundle with fresh nonces and escalated gas
       try {
         bundle = await signRescueBundle(
           provider,
@@ -249,6 +266,7 @@ export async function submitRescueBundle(
         tokenTransferTxs,
         priorityFeeGwei,
         attempt,
+        privateProviders,
       );
 
       if (result.success) {
@@ -257,7 +275,7 @@ export async function submitRescueBundle(
 
       lastError = result.error;
 
-      // Check if funding landed — if yes, only re-sign transfers next attempt
+      // If funding landed but transfers failed, re-sign transfers only
       const funded = await isFunded(
         provider,
         bundle.executorAddress,
@@ -265,9 +283,12 @@ export async function submitRescueBundle(
       );
       if (funded && attempt < MAX_RETRY_ATTEMPTS) {
         console.log(
-          "[RETRY] Funding confirmed, but transfer failed. Re-submitting transfer only with fresh nonce.",
+          "[RETRY] Funding confirmed, but transfer failed. Re-submitting transfers with fresh nonce.",
         );
-        const priorityFee = utils.parseUnits(priorityFeeGwei.toString(), "gwei");
+        const priorityFee = utils.parseUnits(
+          priorityFeeGwei.toString(),
+          "gwei",
+        );
         const escalatedGas = bundle.gasPrice
           .mul(GAS_ESCALATION_FACTOR)
           .div(100);
@@ -278,12 +299,11 @@ export async function submitRescueBundle(
           escalatedGas,
           priorityFee,
         );
-        bundle = { ...bundle, transferTxs: freshTransferTxs };
-        // Submit only transfers (skip re-funding)
         const transferOnly = await submitTransfersOnly(
           provider,
-          bundle.fundingHash ?? "",
+          result.fundingHash,
           freshTransferTxs,
+          privateProviders,
         );
         if (transferOnly.success) {
           return { ...transferOnly, attempts: attempt + 1 };
@@ -307,6 +327,7 @@ export async function submitRescueBundle(
 
 /**
  * Single submission attempt: submit funding, guard nonce staleness, blast transfers.
+ * Also broadcasts to private providers in parallel (fire-and-forget).
  */
 async function attemptSubmission(
   provider: providers.JsonRpcProvider,
@@ -315,8 +336,9 @@ async function attemptSubmission(
   tokenTransferTxs: TokenTransferTx[],
   priorityFeeGwei: number,
   attempt: number,
+  privateProviders: providers.JsonRpcProvider[],
 ): Promise<RescueResult & { fundingHash: string }> {
-  // Guard: check executor nonce hasn't moved since signing
+  // Guard: re-sign transfers if executor nonce moved since signing
   const currentExecutorNonce = await provider.getTransactionCount(
     bundle.executorAddress,
     "pending",
@@ -336,13 +358,24 @@ async function attemptSubmission(
     bundle = { ...bundle, transferTxs: freshTransferTxs };
   }
 
-  // Submit funding tx
+  // Broadcast funding TX to primary + private providers simultaneously
+  broadcastToPrivateProviders(bundle.fundingTx, privateProviders, "Funding TX");
   const fundingResponse = await provider.sendTransaction(bundle.fundingTx);
   console.log(`[SENT] Funding TX: ${fundingResponse.hash}`);
+  if (privateProviders.length > 0) {
+    console.log(
+      `[PRIVATE RPC] Funding TX broadcast to ${privateProviders.length} private endpoint(s)`,
+    );
+  }
 
-  // Immediately blast all transfer txs without waiting for funding confirmation
+  // Immediately blast all transfer TXs in parallel (don't wait for funding confirmation)
   const transferResults = await Promise.all(
     bundle.transferTxs.map(async (signedTx, i) => {
+      broadcastToPrivateProviders(
+        signedTx,
+        privateProviders,
+        `Transfer TX #${i}`,
+      );
       try {
         const resp = await provider.sendTransaction(signedTx);
         console.log(`[SENT] Transfer TX #${i}: ${resp.hash}`);
@@ -353,6 +386,12 @@ async function attemptSubmission(
       }
     }),
   );
+
+  if (privateProviders.length > 0 && bundle.transferTxs.length > 0) {
+    console.log(
+      `[PRIVATE RPC] ${bundle.transferTxs.length} transfer TX(s) broadcast to ${privateProviders.length} private endpoint(s)`,
+    );
+  }
 
   const successfulTransfers = transferResults.filter(
     (
@@ -382,21 +421,26 @@ async function attemptSubmission(
     `[CONFIRMED] Funding TX in block ${fundingReceipt.blockNumber} | Gas used: ${fundingReceipt.gasUsed.toString()}`,
   );
 
-  // Verify executor actually received funds before waiting for transfers
+  // Warn if executor balance is suspiciously low after funding
   const funded = await isFunded(
     provider,
     bundle.executorAddress,
-    bundle.totalGasCost.div(2), // relaxed check: at least half (gas may have been used)
+    bundle.totalGasCost.div(2),
   );
   if (!funded) {
     console.warn(
-      "[WARNING] Executor ETH balance lower than expected after funding TX. Sweeper may have drained it.",
+      "[WARNING] Executor ETH balance lower than expected after funding. Sweeper may have drained it.",
     );
   }
 
   console.log("[WAITING] Waiting for transfer TX confirmations...");
   const transferReceipts = await Promise.all(
-    transferResponses.map((resp) => resp.wait(1)),
+    transferResponses.map((resp) =>
+      resp.wait(1).catch((err: any) => {
+        if (err.receipt) return err.receipt;
+        throw err;
+      }),
+    ),
   );
 
   let allSuccess = true;
@@ -414,20 +458,29 @@ async function attemptSubmission(
     transferHashes: transferResponses.map((r) => r.hash),
     success: allSuccess,
     attempts: attempt,
-    error: allSuccess ? undefined : "One or more transfer transactions reverted",
+    error: allSuccess
+      ? undefined
+      : "One or more transfer transactions reverted",
   };
 }
 
 /**
- * Submit only transfer transactions (when funding already confirmed).
+ * Submit only transfer transactions (when funding is already confirmed).
+ * Also broadcasts to private providers in parallel (fire-and-forget).
  */
 async function submitTransfersOnly(
   provider: providers.JsonRpcProvider,
   fundingHash: string,
   signedTransferTxs: string[],
+  privateProviders: providers.JsonRpcProvider[] = [],
 ): Promise<RescueResult> {
   const transferResults = await Promise.all(
     signedTransferTxs.map(async (signedTx, i) => {
+      broadcastToPrivateProviders(
+        signedTx,
+        privateProviders,
+        `Transfer TX #${i}`,
+      );
       try {
         const resp = await provider.sendTransaction(signedTx);
         console.log(`[SENT] Transfer TX #${i}: ${resp.hash}`);
@@ -440,8 +493,13 @@ async function submitTransfersOnly(
   );
 
   const successfulTransfers = transferResults.filter(
-    (r): r is { success: true; response: providers.TransactionResponse; index: number } =>
-      r.success,
+    (
+      r,
+    ): r is {
+      success: true;
+      response: providers.TransactionResponse;
+      index: number;
+    } => r.success,
   );
 
   if (successfulTransfers.length === 0) {
@@ -476,7 +534,9 @@ async function submitTransfersOnly(
     transferHashes: transferResponses.map((r) => r.hash),
     success: allSuccess,
     attempts: 1,
-    error: allSuccess ? undefined : "One or more transfer transactions reverted",
+    error: allSuccess
+      ? undefined
+      : "One or more transfer transactions reverted",
   };
 }
 
