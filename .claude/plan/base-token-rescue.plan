@@ -1,0 +1,197 @@
+# Implementation Plan: Base Chain Token Rescue from Compromised Wallet
+
+## Situation Analysis
+
+### Compromised Wallet
+- **Address**: `0x81eA9Fe692A2c4e86Ad1079B6C6018b83DD65CFe`
+- **Chain**: Base (chain_id: 8453)
+- **Native ETH**: 0 (swept by bot)
+- **EIP-7702 Delegation**: Active, delegates to `0x4460D7Fc87b1c124DE8a237867062b5D294B5e3c` (unverified contract, likely the sweeper mechanism)
+- **Sweeper Bot**: Monitors and drains any ETH sent to this address
+
+### Tokens Worth Rescuing (~$14.44 total)
+
+| Token | Balance | USD Value | Contract |
+|-------|---------|-----------|----------|
+| SENDIT | 455,701.36 | $4.12 | `0xBa5B9B2D...` |
+| BRETT | 527.13 | $4.01 | `0x532f2710...` |
+| LUM | 8.02 | $2.53 | `0x0fD7a301...` |
+| MAMO | 168.52 | $2.30 | `0x7300B37D...` |
+| BASTR | 967,661.86 | $1.00 | `0x78De5c91...` |
+| Others (45) | various | <$0.50 total | various |
+
+### Why Flashbots Won't Work on Base
+- Base is an OP Stack L2 with a **single sequencer** (Coinbase)
+- **No `eth_sendBundle` support** -- no Flashbots relay for Base
+- **No public mempool** -- sequencer uses FCFS (first-come-first-served) ordering
+- The existing codebase (`@flashbots/ethers-provider-bundle`) is Ethereum-only
+
+## Task Type
+- [x] Backend (TypeScript/ethers.js)
+- [x] Smart Contract (Solidity, optional for permit approach)
+
+## Technical Solution
+
+### Primary Strategy: Rapid Sequential Transaction Submission
+
+Since Base has no Flashbots, we exploit **FCFS sequencer ordering** + **no public mempool**:
+
+1. Pre-sign ALL transactions (funding + token transfers) with correct nonces before submitting any
+2. Submit the ETH funding tx and immediately fire all pre-signed token transfer txs in rapid succession
+3. The sweeper bot must: (a) detect the ETH arrival on-chain, (b) build and submit its sweep tx -- this creates a timing window
+
+### Secondary Strategy: EIP-2612 Permit (Zero-ETH)
+
+For tokens that support `permit()`, we can bypass the sweeper entirely:
+- Sign a permit off-chain with the compromised key (no gas needed)
+- Execute `permit() + transferFrom()` from the sponsor wallet
+- The compromised wallet never receives ETH
+
+### Architecture
+
+```
+src/
+  index.ts                    -> Keep as-is (original Flashbots flow)
+  base-rescue.ts              -> NEW: Main entry for Base chain rescue
+  engine/
+    Base.ts                   -> Keep as-is (abstract base)
+    TransferERC20.ts          -> Keep as-is
+    TransferERC20Batch.ts     -> NEW: Batch multiple ERC-20 transfers
+    PermitTransferERC20.ts    -> NEW: EIP-2612 permit gasless rescue
+  utils.ts                    -> Keep as-is
+  base-utils.ts               -> NEW: Base-specific rapid submission
+```
+
+## Implementation Steps
+
+### Step 1: Add Base Chain Provider Configuration
+- **File**: `src/base-rescue.ts` (new)
+- **Deliverable**: New entry point configured for Base chain RPC
+- Add Base RPC URL configuration (public: `https://mainnet.base.org`, or Alchemy/Infura)
+- Remove Flashbots provider dependency for this flow
+- Keep env vars: `PRIVATE_KEY_EXECUTOR`, `PRIVATE_KEY_SPONSOR`, `RECIPIENT`
+- Add new env vars: `BASE_RPC_URL`, `TOKEN_ADDRESSES` (comma-separated list of tokens to rescue)
+
+### Step 2: Create Batch ERC-20 Transfer Engine
+- **File**: `src/engine/TransferERC20Batch.ts` (new)
+- **Deliverable**: Engine that generates transfer transactions for multiple tokens
+- Accept array of token addresses
+- For each token: check balance, generate `transfer()` calldata
+- Skip tokens with zero balance
+- Return array of TransactionRequests
+
+### Step 3: Create Permit-Based Transfer Engine (Optional Enhancement)
+- **File**: `src/engine/PermitTransferERC20.ts` (new)
+- **Deliverable**: Engine for tokens supporting EIP-2612
+- Check if token implements `permit()` via try/catch
+- Sign permit off-chain with compromised wallet's key
+- Generate `permit()` + `transferFrom()` tx pair (executed by sponsor, NOT executor)
+- This completely bypasses the sweeper
+
+### Step 4: Create Base-Specific Transaction Submitter
+- **File**: `src/base-utils.ts` (new)
+- **Deliverable**: Rapid sequential transaction submission logic
+- Pre-sign ALL transactions before submitting any
+- Use WebSocket provider for lowest latency (if available)
+- Submit funding tx first, then immediately blast all pre-signed txs
+- Use `Promise.all` for parallel RPC submission (not sequential `await`)
+- Implement nonce management: sponsor nonce for funding tx, executor nonces for token transfers
+- Add retry logic with gas price bumping
+
+### Step 5: Implement the Main Rescue Flow
+- **File**: `src/base-rescue.ts`
+- **Deliverable**: Complete rescue orchestration
+- Flow:
+  1. Connect to Base RPC
+  2. Load wallets (executor = compromised, sponsor = funded)
+  3. Get latest block for gas pricing
+  4. For each token: check balance, generate transfer tx
+  5. Estimate gas for all token transfers
+  6. Calculate total ETH needed (sum of gas * gasPrice)
+  7. Pre-sign ALL transactions:
+     - TX 0 (sponsor -> executor): Send exact ETH for gas
+     - TX 1..N (executor): Token transfer for each token
+  8. Submit TX 0, then immediately submit TX 1..N
+  9. Monitor for confirmation
+  10. Report results
+
+### Step 6: Handle EIP-7702 Delegation Concern
+- **File**: `src/base-rescue.ts`
+- **Deliverable**: Detection and warning about EIP-7702 delegation
+- Check if the compromised address has EIP-7702 delegation active
+- Warn user that the delegation contract (`0x4460D7Fc...`) may interfere
+- Optionally: add a step to revoke the EIP-7702 delegation as the FIRST executor tx
+- This requires sending gas first, so it must be part of the rapid submission batch
+
+### Step 7: Update Dependencies and Scripts
+- **File**: `package.json`
+- **Deliverable**: Add start:base script, dotenv dependency
+- Add `"start:base": "npx ts-node --project tsconfig.json src/base-rescue.ts"`
+- Add `dotenv` for env var management
+- No other major deps needed -- ethers v5 supports Base natively
+
+## Key Files
+
+| File | Operation | Description |
+|------|-----------|-------------|
+| `src/base-rescue.ts` | Create | Main entry point for Base rescue |
+| `src/engine/TransferERC20Batch.ts` | Create | Batch multi-token transfer engine |
+| `src/engine/PermitTransferERC20.ts` | Create | EIP-2612 permit-based gasless rescue |
+| `src/base-utils.ts` | Create | Rapid tx submission + nonce management |
+| `package.json` | Modify | Add `start:base` script, add `dotenv` |
+| `src/index.ts` | Keep | Original Flashbots flow untouched |
+| `.env.example` | Create | Document all env vars needed |
+
+## Environment Variables
+
+```
+PRIVATE_KEY_EXECUTOR=<compromised wallet private key>
+PRIVATE_KEY_SPONSOR=<funded wallet private key>
+RECIPIENT=<safe destination address>
+BASE_RPC_URL=https://mainnet.base.org
+TOKEN_ADDRESSES=0xBa5B9B2D...,0x532f2710...,0x0fD7a301...,0x7300B37D...
+PRIORITY_FEE_GWEI=0.1  (optional)
+MAX_FEE_GWEI=0.5       (optional)
+```
+
+## Gas Cost Estimate
+
+On Base, gas is very cheap:
+- Base fee: ~0.001-0.01 gwei
+- L1 data fee: ~0.01-0.05 gwei (for calldata posted to L1)
+- Each ERC-20 transfer: ~65,000 gas
+- ETH transfer (funding): 21,000 gas
+- For 5 tokens: ~346,000 total gas
+- Estimated total cost: **<$0.10** at current Base gas prices
+
+## Risks and Mitigation
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| Sweeper outpaces our txs | High | Use WebSocket for minimum latency; pre-sign everything; submit in burst |
+| EIP-7702 delegation interferes | High | Add delegation revocation as first tx in batch; investigate contract first |
+| Token transfer reverts | Medium | Estimate gas before submitting; skip failing tokens |
+| Nonce conflict | Medium | Get fresh nonces right before submission; use `pending` nonce |
+| Gas price spike | Low | Set generous maxFeePerGas; Base gas is extremely cheap |
+| Total value ($14.44) < effort | Low | Gas on Base is <$0.10, so rescue is economically viable |
+
+## Important Warnings
+
+1. NEVER share or commit private keys -- use `.env` file (already in `.gitignore`)
+2. Test on Base Sepolia first before running on mainnet
+3. The EIP-7702 delegation is suspicious -- the unverified contract at `0x4460D7Fc...` may be how the sweeper operates. Investigate before proceeding.
+4. Total recoverable value is only ~$14.44 -- ensure this justifies the effort
+5. Timing is critical -- run from a machine with low latency to Base's sequencer
+
+## Execution
+
+```
+npm run start:base
+```
+
+The script will:
+1. Display all token balances and USD values
+2. Show total ETH needed for gas
+3. Ask for confirmation before executing
+4. Execute the rescue in one rapid burst
+5. Report success/failure for each token transfer
