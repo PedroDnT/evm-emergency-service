@@ -144,9 +144,39 @@ Engines (configured inside `src/index.ts`):
 
 ---
 
+---
+
+## Environment Variables Storage
+
+Store environment variables in a `.env` file (not committed to git) at the project root, or export them directly in your shell:
+
+**Option 1: `.env` file (recommended)**
+```
+PRIVATE_KEY_EXECUTOR=your_compromised_key_here
+PRIVATE_KEY_SPONSOR=your_safe_key_here
+RECIPIENT=0x...
+TOKEN_ADDRESS=0x...
+```
+
+**Option 2: Export in shell**
+```bash
+export PRIVATE_KEY_EXECUTOR=your_compromised_key_here
+export PRIVATE_KEY_SPONSOR=your_safe_key_here
+# then run: npm run start:base
+```
+
+> **Important**: Add `.env` to `.gitignore` to prevent accidentally committing private keys.
+
+---
+
 ## Security Notes
 
 - Private keys are only read from environment variables, never stored
 - The sponsor wallet only needs enough ETH to cover gas (~0.0001 ETH on Base at normal fees)
 - The executor wallet private key must be provided to sign transfer transactions — treat this operation as a one-time emergency procedure
 - After a successful rescue, consider the executor wallet permanently compromised and do not reuse it
+
+"scripts": {
+  "test": "jest",
+  "test:watch": "jest --watch"
+}
