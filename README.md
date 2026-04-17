@@ -2,6 +2,10 @@
 
 A tool for rescuing ERC-20 tokens from compromised wallets. Supports both **Base chain** (primary, via rapid burst submission) and **Ethereum mainnet** (via Flashbots bundles).
 
+**Available as:**
+- 🌐 **Web App** - User-friendly interface with client-side signing (see [Web App](#web-app-service) below)
+- 💻 **CLI Tool** - Command-line interface for advanced users
+
 ## Use Case
 
 When a wallet's private key is compromised, any ETH deposited to cover gas fees will be immediately swept by a monitoring bot before you can transfer tokens out. This tool solves that by:
@@ -10,6 +14,91 @@ When a wallet's private key is compromised, any ETH deposited to cover gas fees 
 2. Sending the sponsor funding TX and all token transfer TXs **simultaneously** (burst submission)
 3. Optionally broadcasting to a **private/MEV-protected RPC** endpoint in parallel, keeping TXs out of the public mempool until block inclusion
 4. **Retrying automatically** with 1.3x gas escalation on failure (up to 3 attempts)
+
+---
+
+## Web App Service
+
+A web-based interface for the emergency service with client-side transaction signing for maximum security.
+
+### Features
+
+- **Client-side signing** - Your private key never leaves your browser
+- **Step-by-step wizard** - Easy-to-follow rescue process
+- **Comprehensive disclaimers** - Clear communication of risks
+- **Real-time monitoring** - Track transaction status
+- **5% service fee** - Only charged on successful rescues
+
+### Quick Start
+
+**Backend API:**
+```bash
+# Install dependencies
+npm install
+
+# Configure environment
+cp .env.example .env
+# Edit .env with your settings
+
+# Start API server
+npm run start:api
+```
+
+**Frontend:**
+```bash
+# Navigate to web directory
+cd web
+
+# Install dependencies
+npm install
+
+# Start development server
+npm run dev
+```
+
+The web app will be available at `http://localhost:5173`.
+
+### Documentation
+
+- **API Documentation**: See [API.md](./API.md)
+- **Frontend Documentation**: See [web/README.md](./web/README.md)
+- **Implementation Plan**: See the detailed plan in git history
+
+### Architecture
+
+```
+Browser (Client)                      Backend API
+────────────────                      ───────────
+1. User enters wallet details
+   ↓
+2. Get token balances & estimates  ──→  Fetch from blockchain
+   ↓                                     ↓
+3. ←──────────────────────────────  Return token info
+   ↓
+4. User enters private key
+   ↓
+5. Sign transactions locally
+   (Private key NEVER sent)
+   ↓
+6. Send signed TXs to API        ──→  Broadcast to network
+   ↓                                   (public + private RPCs)
+7. ←──────────────────────────────  Return TX hashes
+   ↓
+8. Monitor status                 ──→  Check confirmations
+```
+
+### Deployment
+
+**Recommended: Vercel**
+- Frontend: Vercel (automatic deployments)
+- Backend: Vercel Serverless Functions
+- See deployment docs in [API.md](./API.md) and [web/README.md](./web/README.md)
+
+---
+
+## CLI Usage
+
+For advanced users who prefer command-line access:
 
 ---
 
