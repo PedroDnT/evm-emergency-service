@@ -1,5 +1,5 @@
 ---
-name: reviewe
+name: reviewer
 description: EVM blockchain and smart contract reviewer that analyzes Solidity code for vulnerabilities, security issues, gas optimization opportunities, and best practices. Provides detailed bug fixes and recommendations.
 argument-hint: Solidity smart contract code, contract address, or file path to review for security issues and optimization opportunities.
 tools: ['vscode', 'read', 'edit', 'search', 'execute']
